@@ -153,13 +153,15 @@ class PaliGemmaForConditionalGeneration(nn.Module):
 
         if kv_cache is None or kv_cache.num_items() == 0:
             # prefill stage
+            # no masking, paliGemma design
             causal_mask = torch.full(
                 (batch_size, q_len, q_len), fill_value=0, dtype=dtype, device=device)
         else:
             # generation stage
             assert q_len == 1
             kv_len = kv_cache.num_items() + q_len
-            # Also do not mask anything
+            # Also do not mask anything, paliGemma design
+            # 1 x kv_len
             causal_mask = torch.full(
                 (batch_size, q_len, kv_len), fill_value=0, dtype=dtype, device=device)
 
