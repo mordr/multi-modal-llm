@@ -169,8 +169,18 @@ class PaliGemmaForConditionalGeneration(nn.Module):
         # (batch_size, q_len, kv_len) -> (batch_size, num_heads_q, q_len, kv_len)
         causal_mask = causal_mask.unsqueeze(1)
 
+        if kv_cache is not None and kv_cache.num_items() > 0:
+            # position of query is last position
+            position_ids = attention_mask.cumsum(-1)[:, -1]
+            if position_ids.dim() == 1:
+                position_ids = position_ids.unsqueeze(0)
+        else:
+            # create position ids based on size of the attention mask
+            # for masked tokens, use 1 as position
+            position_ids = (attention_mask.cumsum(-1)
+                            ).masked_fill_((attention_mask == 0), 1).to(device)
 
-
+        return final_embedding, attention_mask, position_ids
 
 
     def forward(self,
