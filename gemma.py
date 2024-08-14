@@ -180,7 +180,7 @@ class PaliGemmaForConditionalGeneration(nn.Module):
             position_ids = (attention_mask.cumsum(-1)
                             ).masked_fill_((attention_mask == 0), 1).to(device)
 
-        return final_embedding, attention_mask, position_ids
+        return final_embedding, causal_mask, position_ids
 
 
     def forward(self,
