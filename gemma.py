@@ -4,6 +4,7 @@ from typing import Optional, Tuple, List
 from torch.nn import CrossEntropyLoss
 import math
 from siglip import SiglipVisionConfig, SiglipVisionModel
+from typing import List
 
 
 class GemmaConfig:
@@ -93,6 +94,18 @@ class PaliGemmaMultiModalProjector(nn.Module):
         return self.linear(image_features)
 
 
+def apply_rotary_pos_emb():
+    pass
+
+
+def repeat_kv(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
+    batch, num_key_value_heads, slen, head_dim = hidden_states.shape
+    if n_rep == 1:
+        return hidden_states
+    hidden_states = hidden_states[:, :, None, :, :].expand(
+        batch, num_key_value_heads, n_rep, slen, head_dim)
+    return hidden_states.reshape(batch, num_key_value_heads * n_rep, slen, head_dim)
+
 class GemmaAttention(nn.Module):
     def __init__(self, config: GemmaConfig, layer_idx: Optional[int] = None):
         super().__init__()
@@ -158,7 +171,51 @@ class GemmaAttention(nn.Module):
         value_states = value_states.view(
             bsz, q_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
 
+        # (batch_size, seq_len, head_dim), (batch_size, seq_len, head_dim)
+        cos, sin = self.rotary_emb(value_states, position_ids, seq_len=None)
+        query_states, key_states = apply_rotary_pos_emb(
+            query_states, key_states, cos, sin)
 
+        if kv_cache is not None:
+            key_states, value_states = kv_cache.update(
+                key_states, value_states, self.layer_idx)
+
+        # repeat key and values to match the number of heads
+        key_states = repeat_kv(key_states, self.num_key_value_groups)
+        value_states = repeat_kv(value_states, self.num_key_value_groups)
+
+        # Calculate Q * K^T / sqrt(head_dim)
+        # (batch_size, num_heads_q, seq_len_q, seq_len_kv)
+        attn_weights = torch.matmul(
+            query_states, key_states.transpose(2, 3)) / math.sqrt(self.head_dim)
+
+        assert attention_mask is not None
+        attn_weights = attn_weights + attention_mask
+
+        # Apply softmax
+        # (batch_size, num_heads_q, seq_len_q, seq_len_kv)
+        attn_weights = nn.Softmax(dim=-1)(attn_weights)
+        # Apply dropout
+        attn_weights = nn.Dropout(self.attention_dropout)(attn_weights)
+        # Multiply by values
+        # (batch_size, num_heads_q, seq_len_q, seq_len_kv) * (batch_size, num_heads_kv, seq_len_kv, head_dim) -> (batch_size, num_heads_q, seq_len_q, head_dim)
+        attn_output = torch.matmul(attn_weights, value_states)
+
+        if attn_output.size() != (bsz, self.num_heads, q_len, self.head_dim):
+            raise ValueError(
+                f"`attn_output` should be {(bsz, self.num_heads, q_len, self.head_dim)} but is {attn_output.size()}"
+            )
+
+        # Ensure seq len is second dim
+        # (batch_size, num_heads_q, seq_len_q, head_dim) -> (batch_size, seq_len_q, num_heads_q, head_dim)
+        attn_output = attn_output.transpose(1, 2).contiguous()
+        # Concat all heads together
+        # (batch_size, seq_len_q, num_heads_q * head_dim)
+        attn_output = attn_output.view(bsz, q_len, -1)
+        # (batch_size, seq_len_q, hidden_size)
+        attn_output = self.o_proj(attn_output)
+
+        return attn_output, attn_weights
 
 class GemmaMLP(nn.Module):
     def __init__(self, config: GemmaConfig):
@@ -325,8 +382,33 @@ class GemmaForCausalLM(nn.Module):
 
         return output_data
 
-class KVCache(nn.Module):
-    pass
+
+class KVCache():
+    def __init__(self):
+        self.key_cache: List[torch.Tensor] = []
+        self.value_cache: List[torch.Tensor] = []
+
+    def num_items(self) -> int:
+        if len(self.key_cache) == 0:
+            return 0
+        else:
+            # shape of cache entry is (batch_size, num_heads_kv, seq_len, head_dim)
+            return self.key_cache[0].shape[-2]
+
+    def update(self, key_states: torch.Tensor, value_states: torch.Tensor, layer_idx: int) -> Tuple[torch.Tensor, torch.Tensor]:
+        if len(self.key_cache) <= layer_idx:
+            # Never added anything for this layer_idx, create
+            self.key_cache.append(key_states)
+            self.value_cache.append(value_states)
+        else:
+            # otherwise concat the newy keys with existing ones
+            # each tensor (batch_size, num_heads_kv, seq_len, head_dim)
+            self.key_cache[layer_idx] = torch.cat(
+                [self.key_cache[layer_idx], key_states], dim=-2)
+            self.value_cache[layer_idx] = torch.cat(
+                [self.value_cache[layer_idx], value_states], dim=-2)
+        # return all existing keys + new ones
+        return self.key_cache[layer_idx], self.value_cache[layer_idx]
 
 
 class PaliGemmaForConditionalGeneration(nn.Module):
