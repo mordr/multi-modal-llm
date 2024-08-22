@@ -78,11 +78,6 @@ class PaliGemmaConfig:
             self.vision_config.image_size // self.vision_config.patch_size) ** 2
         self.vision_config.projection_dim = projection_dim
 
-
-class KVCache():
-    pass
-
-
 class GemmaRotaryEmbedding(nn.Module):
     def __init__(self, dim, max_position_embedding=2048, base=10000, device=None):
         super().__init__()
